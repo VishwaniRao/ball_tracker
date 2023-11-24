@@ -1,0 +1,905 @@
+import pybgs as bgs
+import cv2
+import ffmpeg
+import math
+import glob
+import os
+import random
+import numpy as np
+import numpy as np
+import matplotlib.pyplot as plt
+from numpy.linalg import inv
+import matplotlib.pyplot as plt
+from sklearn.cluster import DBSCAN,KMeans,SpectralClustering
+from sklearn.mixture import GaussianMixture
+from sklearn.datasets import make_blobs
+from scipy.spatial import ConvexHull, convex_hull_plot_2d
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import euclidean_distances
+from scipy import stats
+from sklearn.preprocessing import minmax_scale
+from skimage.measure import LineModelND, ransac
+import tensorflow_hub as hub
+import tensorflow as tf
+from circle_fit import taubinSVD
+from sympy import Point, Line 
+from tqdm import tqdm
+    
+    
+# Apply image detector on a batch of image.
+# detector = hub.load("https://tfhub.dev/tensorflow/efficientdet/lite4/detection/1")s
+# boxes, scores, classes, num_detections = detector(image_tensor)
+if cv2.__version__.startswith('4'):
+    print("Opencv 4 branch is installed")
+    
+plt.rcParams['figure.figsize'] = [12, 8]
+plt.rcParams['figure.dpi'] =100
+
+
+def is_cv2():
+    return check_opencv_version("2.")
+
+def is_cv3():
+    return check_opencv_version("3.")
+
+def is_lower_or_equals_cv347():
+  [major, minor, revision] = str(cv2.__version__).split('.')
+  return int(major) == 3 and int(minor) <= 4 and int(revision) <= 7
+
+def is_cv4():
+    return check_opencv_version("4.")
+
+def check_opencv_version(major):
+    return cv2.__version__.startswith(major)
+
+## bgslibrary algorithms
+algorithms=[]
+algorithms.append(bgs.FrameDifference())
+algorithms.append(bgs.StaticFrameDifference())
+algorithms.append(bgs.WeightedMovingMean())
+algorithms.append(bgs.WeightedMovingVariance())
+algorithms.append(bgs.AdaptiveBackgroundLearning())
+algorithms.append(bgs.AdaptiveSelectiveBackgroundLearning())
+algorithms.append(bgs.MixtureOfGaussianV2())
+algorithms.append(bgs.PixelBasedAdaptiveSegmenter())
+algorithms.append(bgs.SigmaDelta())
+algorithms.append(bgs.SuBSENSE())
+algorithms.append(bgs.LOBSTER())
+algorithms.append(bgs.PAWCS())
+algorithms.append(bgs.TwoPoints())
+algorithms.append(bgs.ViBe())
+algorithms.append(bgs.CodeBook())
+#algorithms.append(bgs.FuzzySugenoIntegral())
+# algorithms.append(bgs.FuzzyChoquetIntegral())
+# algorithms.append(bgs.LBSimpleGaussian())
+# algorithms.append(bgs.LBFuzzyGaussian())
+# algorithms.append(bgs.LBMixtureOfGaussians())
+# algorithms.append(bgs.LBAdaptiveSOM())
+# algorithms.append(bgs.LBFuzzyAdaptiveSOM())
+# algorithms.append(bgs.VuMeter())
+# algorithms.append(bgs.KDE())
+# algorithms.append(bgs.IndependentMultimodal())
+
+if is_cv2():
+    algorithms.append(bgs.MixtureOfGaussianV1()) # if opencv 2.x
+    algorithms.append(bgs.GMG()) # if opencv 2.x
+
+if not is_cv2():
+    algorithms.append(bgs.KNN()) # if opencv > 2
+
+if is_cv2() or is_cv3():
+    algorithms.append(bgs.DPAdaptiveMedian())
+    algorithms.append(bgs.DPGrimsonGMM())
+    algorithms.append(bgs.DPZivkovicAGMM())
+    algorithms.append(bgs.DPMean())
+    algorithms.append(bgs.DPWrenGA())
+    algorithms.append(bgs.DPPratiMediod())
+    algorithms.append(bgs.DPEigenbackground())
+    algorithms.append(bgs.DPTexture())
+    algorithms.append(bgs.T2FGMM_UM())
+    algorithms.append(bgs.T2FGMM_UV())
+    algorithms.append(bgs.T2FMRF_UM())
+    algorithms.append(bgs.T2FMRF_UV())
+    algorithms.append(bgs.MultiCue())
+
+if is_cv2() or is_lower_or_equals_cv347():
+    algorithms.append(bgs.LBP_MRF())
+    algorithms.append(bgs.MultiLayer())
+
+print(len(algorithms))
+
+class BallTracker:
+    def __init__(self, input_video,cam_orientation,batsman_orientation,roi,hg_pitch,hg_pitch_coords,pitch_coords,players):
+        self.input = input_video
+        self.cam_orientation = cam_orientation
+        self.batsman_orientation  = batsman_orientation
+        self.roi = roi
+        self.hg_pitch = hg_pitch
+        self.hg_pitch_coords = hg_pitch_coords
+        self.pitch_coords = pitch_coords
+        self.videoPlayable = True
+        self.players = players
+        self.startFrame = 0
+        
+
+        cap = cv2.VideoCapture(self.input)
+        if (cap.isOpened()== False): 
+            self.videoPlayable = False
+
+
+        self.frame_width = int(cap.get(3))
+        self.frame_height = int(cap.get(4))
+        self.fps = int(cap.get(5))
+        self.frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.frames = []
+        
+        self.bgs = []
+        
+        self.contourFrames = []
+        self.contourCenterFrames = []
+        self.impContours = []
+        self.contourCenters = []
+        self.centersWithoutBatsman = []
+        self.pureCenters = []
+        self.gridCenters = {}
+        self.radii=[]
+        self.radius = []
+        self.contourAreas = []
+        self.contourPerimeter = []
+        self.contourColor = []
+        self.contourCentersWithoutPeeps = []
+        self.contourCrops = []
+        self.cannyCrops=[]
+        
+        self.detections = {}
+        self.allDetections = {}
+        self.batsman = None
+
+        self.foundBall = False
+        self.stopFrame=None
+        cap.release()
+      
+    
+    def debug_(self,debug,outs,desc):
+            samples,shuffle,start = debug
+            if samples > 0:
+                sample_imgs = outs
+                debugFrames = [sample_imgs[i] for i in range(start,start+samples)]
+                if shuffle == 1:
+                    random.shuffle(debugFrames)
+                
+                row = math.ceil(np.sqrt(samples))
+                fig,axs = plt.subplots(row,row,figsize=(30,30))
+                count = 0
+                for i in range(row):
+                    for j in range(row):
+                        if count == samples:
+                            break
+                        axs[i][j].imshow(debugFrames[count])
+                        count = i*row + j
+                        axs[i][j].set(title=str(count))
+                        
+
+            
+    def debug1v1(self,debug,desc,debugVideo,debugVideoName):
+        samples,shuffle,start = debug
+        if samples > 0 or debugVideo ==1:
+            samples = self.frame_count 
+            feature1 = [self.bgs[i] for i in range(1,len(self.bgs)) if i < samples ]
+            feature2 = [self.contourFrames[i] for i in range(1,len(self.contourFrames)) if i < samples]
+            all_samples = []
+            for i in range(1,samples-1):
+                feature1[i+start] = cv2.merge((feature1[i+start],feature1[i+start],feature1[i+start]))
+                h_,w_,_ = feature1[i+start].shape
+                h,w,_ = feature2[i+start].shape
+                if h ==h_:
+                    all_samples.append(np.hstack((feature1[i+start],feature2[i+start])))
+                if h_ > h:
+                    extra = np.vstack((feature2[i+start],np.zeros((h_-h,w,3),np.uint8)))
+                    all_samples.append(np.hstack((feature1[i+start],extra)))
+
+                if h > h_:
+                    extra = np.vstack((feature1[i+start],np.zeros((h-h_,w_,3),np.uint8)))
+                    all_samples.append(np.hstack((extra,feature2[i+start])))
+
+            '''
+            write radius error, area, perimeter to frames
+            '''        
+            new_frames = []
+            for idx in range(0,len(all_samples)):
+                h,w,c = all_samples[0].shape
+                h_ = 200
+                extra = np.ones((h_,w,c),np.int8)
+                ystart = 2
+                xstart = 2
+                rad = self.radii[idx]
+                area = self.contourAreas[idx]
+                per = self.contourPerimeter[idx]
+                ctr_color = self.contourColor[idx]
+#                 print(len(rad),len(color))
+#                 print(color)
+                size = math.ceil(np.sqrt(len(rad)))
+                rows = np.linspace(0,h_,size+1)[:size]
+                cols = np.linspace(0,w,size+1)[:size]
+                count = 0
+#                 print(idx,size,len(rad),len(rows),len(cols))
+                for id_r,r in enumerate(rows):
+                    for id_c,c in enumerate(cols):
+                        count = size*id_r + id_c 
+#                         print(count)
+                        if count < len(rad):
+                            r_ = rad[count]
+                            a_ = area[count]
+                            p_ = per[count]    
+#                             c_ = ctr_color[count]
+#                             print(count,c_)
+
+                            strr = "{} {} {}".format(r_,p_,a_)
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            color = (255,255,255)
+                            loc = (int(c+10),int(r+30))
+                            extra = cv2.putText(extra,strr,loc,font, 0.5,color, 2, cv2.LINE_AA)
+                            
+#                             strr = '{} {} {}'.format(int(c_[0]),int(c_[1]),int(c_[2]))
+#                             extra = cv2.putText(extra,strr,(int(c+10),int(r+50)),font, 0.5,color, 2, cv2.LINE_AA)
+                            count = count +1
+#                 print("xxxxx")
+                new_frames.append(np.vstack((all_samples[idx],extra)))
+
+                
+            if debugVideo == 1:
+                output = '.'+self.input.split('.')[1]+'-ctr.avi'
+                output = debugVideoName
+                h,w,c = new_frames[0].shape
+                result = cv2.VideoWriter(output, cv2.VideoWriter_fourcc(*'MJPG'),self.fps, (w,h))
+                for frame in new_frames:
+                    frame = cv2.convertScaleAbs(frame)
+                    result.write(frame)
+                result.release()            
+
+                
+            #size = math.ceil(np.sqrt(len(new_frames)))
+            #fig,axs = plt.subplots(size,size,figsize=(30,30))
+            #count = 0
+            #for i in range(size):
+            #    for j in range(size):
+            #        if count == samples-1:
+            #            break
+            #        axs[i][j].imshow(new_frames[count])
+            #        count = i*size + j
+            #        axs[i][j].set(title=str(count))   
+                    
+                    
+    def debugContours(self,output_path):
+        
+        
+        h,w = self.bgs[0].shape
+        mask = np.zeros((h,w,3), np.uint8)
+        output = '.'+self.input.split('.')[1]+'-color.avi'
+        output = output_path
+        result = cv2.VideoWriter(output, cv2.VideoWriter_fourcc(*'MJPG'),self.fps, (w*3,h))
+        
+        for id_,ctrs in enumerate(self.contourCrops):
+            if len(ctrs)>1:
+                size = math.ceil(np.sqrt(len(ctrs)))
+                rows = np.linspace(0,h,size+1)[:size]
+                cols = np.linspace(0,w,size+1)[:size]
+                mask_copy = mask.copy()
+                canny_copy = mask.copy()
+                write_frame = mask.copy()
+                canny_crops = self.cannyCrops[id_]
+
+#                 print("Frame :: " + str(id_) + ' ctrs ' + str(len(ctrs)) + ' ' + str(size))
+                for idx,ctr in enumerate(ctrs):
+                    shape = (int(rows[1]),int(cols[1]))
+
+                    resize=cv2.resize(ctr,shape,interpolation = cv2.INTER_LINEAR)
+                    row_ = int((idx)/size)
+                    col_ = idx - row_*(size)
+                    mask_copy[int(cols[col_]):int(cols[col_])+int(rows[1]),int(rows[row_]):int(rows[row_])+int(rows[1])]=resize
+                    
+                    resize=cv2.resize(canny_crops[idx],shape,interpolation = cv2.INTER_LINEAR)
+                    canny_copy[int(cols[col_]):int(cols[col_])+int(rows[1]),int(rows[row_]):int(rows[row_])+int(rows[1])]=cv2.merge((resize,resize,resize))
+
+
+                    '''
+                    write stuff here
+                    '''
+                    write_copy = np.zeros((shape[0],shape[1],3),np.uint8)
+                    rad = self.radii[id_][idx]
+                    r = self.radius[id_][idx]
+                    area = self.contourAreas[id_][idx]
+                    per = self.contourPerimeter[id_][idx]
+                    ctr_color = self.contourColor[id_][idx]
+                    strr = "{} {} {}".format(r,rad,area)
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    color = (255,255,255)
+                    loc = (int(10),int(30))
+                    cv2.putText(write_copy,strr,loc,font, 0.5,color, 2, cv2.LINE_AA)      
+                    write_frame[int(cols[col_]):int(cols[col_])+int(rows[1]),int(rows[row_]):int(rows[row_])+int(rows[1])]=write_copy
+                
+                total = np.hstack((mask_copy,canny_copy,write_frame))
+                cv2.putText(total,str(id_),(10,30),font, 0.9,(255,0,0), 2, cv2.LINE_AA)      
+                result.write(total)
+        result.release()    
+        
+        
+    def runFrames(self,debug):
+        if self.videoPlayable:
+            cap = cv2.VideoCapture(self.input)
+            for i in tqdm(range(self.frame_count),desc="=====>collecting frames"):
+                ret,frame_ = cap.read()
+                if ret:
+                    frame_ =  frame_[self.roi[0][1]:self.roi[1][1],self.roi[0][0]:self.roi[1][0]]
+                    self.frames.append(frame_)
+            cap.release()
+            
+            self.debug_(debug,self.frames,'ROI images')
+
+    
+            
+    def backgroundSubtraction(self,debug,debugVideo,type_,out,k_size,iter_):
+        algo_name = random.randint(0,len(algorithms))
+        algo_name = 0
+        algorithm = algorithms[type_]
+        if debugVideo == 1:
+            # output = './'+dir+'/'+self.input.split('.')[1]+'-{}-bgs.avi'.format(type_)
+            output = out
+            h,w,c = self.frames[0].shape
+            result = cv2.VideoWriter(output, cv2.VideoWriter_fourcc(*'MJPG'),self.fps, (w,h))
+        
+        for i in tqdm(range(self.frame_count),desc="=====>computing background subtraction"):
+            img_output = algorithm.apply(self.frames[i])
+            img_bgmodel = algorithm.getBackgroundModel()
+#             img_output = cv2.bilateralFilter(img_output, 9, 90, 90)
+
+            kernel = np.ones((k_size, k_size), np.uint8)  
+            erosion = cv2.erode(img_output, kernel, iterations=iter_)
+            img_output = cv2.dilate(erosion, kernel, iterations=iter_)
+
+
+            self.bgs.append(img_output)
+            if debugVideo:
+                result.write(cv2.merge((img_output,img_output,img_output)))
+        
+        if debugVideo:
+            result.release()
+        self.debug_(debug,self.bgs,'Frame Difference BGS')
+        
+
+    def getContourDetails(self,binary_img):
+        internal_contours,_ = cv2.findContours(binary_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        k,rad,error_rad,area = None,None,None,None
+        if len(internal_contours) > 0 :
+            c = max(internal_contours, key = cv2.contourArea)
+            area = cv2.contourArea(c)
+            perimeter = cv2.arcLength(c, True)
+            M = cv2.moments(c)
+            radius2pt = []
+            #approx = cv2.approxPolyDP(c, 0.0001 * cv2.arcLength(c, True), True)
+            #k=cv2.isContourConvex(c)
+
+            if (M['m00'] != 0):
+                cx , cy= int(M['m10']/M['m00']),int(M['m01']/M['m00'])
+                for pt in c:
+                    dist = np.linalg.norm(np.array((cx,cy)) - np.array(pt[0]))
+                    radius2pt.append(dist)
+
+                error_rad = np.std(radius2pt)
+                rad = np.mean(radius2pt)
+                
+
+        return rad,error_rad,area
+
+    def getContours(self,maxArea,minArea,contourThresh,debug,debugVideo,debugVideoName):
+        #                     if w > h:
+#                         if (w/h) < 2 :
+#                             cx , cy= int(M['m10']/M['m00']),int(M['m01']/M['m00'])
+#                             imp_contours.append(ctr)
+#                             imp_centers.append((cx,cy))
+#                     if h > w:
+#                         if (h/w) < 2:
+#                             cx , cy= int(M['m10']/M['m00']),int(M['m01']/M['m00'])
+#                             imp_contours.append(ctr)
+#                             imp_centers.append((cx,cy))
+#                 approx = cv2.approxPolyDP(ctr, .1 * cv2.arcLength(ctr, True), True)
+#                 k=cv2.isContourConvex(approx)
+#                 if k:
+
+ 
+        minArea1, minArea2 = minArea
+        mask = np.zeros(self.bgs[0].shape, np.uint8)
+
+        count  = random.randint(0,100000)
+        for i in tqdm(range(len(self.bgs)),desc="=====> contour detection"):
+            imp_contours,imp_centers,imp_radii,imp_areas,imp_perimeter,ctr_color,ctr_crops,rad,canny_crops = [],[],[],[],[],[],[],[],[]
+            contours,_ = cv2.findContours(self.bgs[i], cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+            for idx,ctr in enumerate(contours):
+                area = cv2.contourArea(ctr)
+                M = cv2.moments(ctr)
+                radius2pt = []
+                perimeter = cv2.arcLength(ctr, True) 
+                
+                if self.foundBall:
+                    minArea = minArea1
+                else:
+                    minArea = minArea2
+                if ((M['m00'] != 0) & (area < maxArea) & (area > minArea) ):
+                    x,y,w,h = cv2.boundingRect(ctr)
+                    cx , cy= int(M['m10']/M['m00']),int(M['m01']/M['m00'])
+                    for pt in ctr:
+                        dist = np.linalg.norm(np.array((cx,cy)) - np.array(pt[0]))
+                        radius2pt.append(dist)
+
+                    std_radius2pt = np.std(radius2pt)
+                    mean_radius2pt = np.mean(radius2pt)
+                    if std_radius2pt < contourThresh:
+                        
+                        '''
+                        # write crop to folder
+                        # '''
+                        # out_folder = '/Users/muck27/Downloads/qt-stuff/trial/classifier/all/'
+                        # out_file = out_folder + str(count)+'.jpg'
+                        # cv2.imwrite(out_file,self.frames[i][y:y+h,x:x+w])
+                        # count = count + 1
+
+                        imp_contours.append(ctr)
+                        imp_centers.append((cx,cy,round(mean_radius2pt,2)))
+                        imp_radii.append(round(std_radius2pt,2))
+                        imp_areas.append(round(area,2))
+                        imp_perimeter.append(round(perimeter,2))
+                        rad.append(round(mean_radius2pt,2))
+#                         '''
+#                         check for another circle
+#                         '''
+
+#                         rgb_crop = self.frames[i][y:y+h,x:x+w]
+#                         gaussian_3 = cv2.GaussianBlur(rgb_crop, (0, 0), 2.0)
+#                         rgb_crop = cv2.addWeighted(rgb_crop, 2.0, gaussian_3, -1.0, 0)
+#                         rgb_crop = cv2.convertScaleAbs(rgb_crop)
+#                         gray = cv2.cvtColor(rgb_crop, cv2.COLOR_BGR2GRAY)
+#                         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+#                         tight = cv2.Canny(blurred, 240, 250)
+                        
+#                         radius,error_radius,area_ = self.getContourDetails(tight)
+#                         if radius and radius > 2 and error_radius <5:
+
+#                             imp_contours.append(ctr)
+#                             imp_centers.append((cx,cy))
+#                             imp_radii.append(round(error_radius,2))
+#                             imp_areas.append(round(area_,2))
+#                             imp_perimeter.append(round(perimeter,2))
+#                             rad.append(round(radius,2))
+                        
+#                             mask_copy = mask.copy()
+#                             cv2.drawContours(mask_copy, ctr, -1, 255, -1)
+                        
+#                             hsv = cv2.cvtColor(self.frames[i], cv2.COLOR_BGR2HSV)
+#                             rgb_crop = self.frames[i][y:y+h,x:x+w]
+#                             cv2.circle(rgb_crop,(int(w/2),int(h/2)),int(mean_radius2pt),(255,0,0),1)
+                        
+#                             mean = cv2.mean(hsv, mask=mask_copy)
+                        
+#                             ctr_color.append(mean)
+#                             ctr_crops.append(rgb_crop)
+#                             canny_crops.append(tight)
+
+#                             self.foundBall = True 
+        
+            self.contourAreas.append(imp_areas)
+            self.contourPerimeter.append(imp_perimeter)
+            self.impContours.append(imp_contours)
+            self.contourCenters.append(imp_centers)
+            self.radii.append(imp_radii)
+            self.contourColor.append(ctr_color)
+            self.contourCrops.append(ctr_crops)
+            self.radius.append(rad)
+            self.cannyCrops.append(canny_crops)
+#             print(i,len(imp_radii),len(imp_areas),len(imp_perimeter),len(imp_contours),len(imp_centers))
+            
+            '''
+            debug
+            '''
+            h,w  = self.roi[1][1] - self.roi[0][1], self.roi[1][0] - self.roi[0][0]
+            ctr_image = np.zeros((h,w,3), np.uint8)
+            center_image = np.zeros((h,w,3), np.uint8)
+            cv2.drawContours(ctr_image, imp_contours,  -1, (255,0,0), 2)
+            self.contourFrames.append(ctr_image)
+            #print(i,len(imp_contours),len(imp_centers))
+            for cen in imp_centers:
+                cv2.circle(center_image,(cen[0],cen[1]),5,(255,255,0),-1)
+            self.contourCenterFrames.append(ctr_image)
+
+        self.debug1v1(debug,"Contour Detection",debugVideo,debugVideoName)
+        
+    
+    def viewContours(self,debug,output):
+        samples,start_frame = debug
+        h,w  = self.roi[1][1] - self.roi[0][1], self.roi[1][0] - self.roi[0][0]
+        ctr_image = np.zeros((h,w,3), np.uint8) 
+    
+        # print(self.allDetections)
+        for idx,frame_ in enumerate(self.contourCenters):
+            if idx >= start_frame:
+                for cen in frame_:
+                    cv2.circle(ctr_image,(cen[0],cen[1]),2,(0,255,255),-1)
+        
+        dets = self.allDetections[start_frame]['dets']
+        areas = self.allDetections[start_frame]['area']
+        batsman_idx,bowler_idx = np.argmin(areas),np.argmax(areas)
+        ymax,xmax,ymin,xmin = dets[bowler_idx]
+        cv2.rectangle(ctr_image,(int(xmin),int(ymin)),(int(xmax),int(ymax)),(255,0,0),1 )
+        
+        cv2.imwrite(output,ctr_image)
+        # fig,axs = plt.subplots(1,1,figsize=(30,30))
+        # # axs.imshow(ctr_image)
+        # fig.savefig(output)
+
+    
+
+    def contoursWithoutPeeps(self):
+        for i in tqdm(range(len(self.frames)),desc="=====>Remove person contours"):
+            dets = self.allDetections[i]['dets']
+            cen_contours = self.contourCenters[i]
+            
+            if len(cen_contours) > 0 and len(dets) > 0:
+                contours = self.impContours[i]
+                inside_pts = []
+                for det in dets:
+                    ymax,xmax,ymin,xmin = det
+
+                    inside_ = self.pointInRect([(xmin,ymin),(xmax,ymax)],cen_contours)
+                    inside_pts = np.hstack((inside_pts,inside_))
+
+
+                outside_pts = []
+                for pt in cen_contours:
+                    if pt not in inside_pts:
+                        outside_pts.append(pt)
+
+                print(i,len(cen_contours),len(outside_pts))
+                self.contourCentersWithoutPeeps.append(outside_pts)
+                
+            if len(cen_contours) > 0 and len(dets) == 0:
+                self.contourCentersWithoutPeeps.append(cen_contours)
+            if len(cen_contours) == 0 :
+                self.contourCentersWithoutPeeps.append([])
+            
+            
+            
+    def getAllDetections(self,detector,stopFrame):
+        
+        self.stopFrame = stopFrame
+        for i in tqdm(range(len(self.frames)),desc="=====> person detection"):
+            if i < self.stopFrame:
+                dets = []
+                areas = []
+                tensor = tf.convert_to_tensor(self.frames[i])
+                tensor = tf.expand_dims(tensor, axis=0)
+                boxes, scores, classes, num_detections = detector(tensor)
+                c  = np.where(classes[0] == 1)[0]
+                person_boxes = []
+                updated = False
+                for person in c:
+                    if scores[0][person] > 0.3:
+                        dets.append(boxes[0][person].numpy())
+                        ymax,xmax,ymin,xmin = boxes[0][person]
+                        areas.append((ymax-ymin)*(xmax-xmin))
+
+                self.allDetections[i] = {}
+                self.allDetections[i]['area'] = areas
+                self.allDetections[i]['dets'] = dets
+                if len(dets) == self.players and self.startFrame == None:
+                    self.startFrame = i
+                    break
+        # print(detector)
+        # print(self.allDetections)
+        return self.startFrame
+         
+            
+            
+    def getDetections(self,patches,debug,detector):
+        patches = np.linspace(0,self.frame_count,patches)
+        foundDetection = 0
+        for i in tqdm(range(len(self.frames)),desc="=====> person detection"):
+            if i in patches and i != self.frame_count:
+                dets = []
+                areas = []
+                tensor = tf.convert_to_tensor(self.frames[i])
+                tensor = tf.expand_dims(tensor, axis=0)
+                boxes, scores, classes, num_detections = detector(tensor)
+                c  = np.where(classes[0] == 1)[0]
+                person_boxes = []
+                updated = False
+                for person in c:
+                    if scores[0][person] > 0.3:
+                        dets.append(boxes[0][person].numpy())
+                        ymax,xmax,ymin,xmin = boxes[0][person]
+                        areas.append((ymax-ymin)*(xmax-xmin))
+                        if not updated:
+                            foundDetection = foundDetection + 1
+                            updated = True
+    
+                self.detections[i] = {}
+                self.detections[i]['area'] = areas
+                self.detections[i]['bbox'] = dets
+      
+        '''
+        debug
+        '''
+        if debug:
+            fig,axs = plt.subplots(1,foundDetection,figsize=(15,15))
+            for i in range(foundDetection):
+                frame_number = int(patches[i])
+                frame_ = self.frames[frame_number]
+                for det in self.detections[frame_number]['bbox']:
+                    ymax,xmax,ymin,xmin = det
+                    cv2.rectangle(frame_,(int(xmax),int(ymax)),(int(xmin),int(ymin)),(255,255,0),2)
+                axs[i].imshow(frame_)
+                axs[i].set(title=frame_number)
+                
+             
+    def pointInRect(self,rect, points) :
+        inside_pts = []
+        x1, y1, x2,y2 = rect[0][0],rect[0][1],rect[1][0],rect[1][1]
+        for p in points:
+            x,y = p
+            if (x1 < x and x < x2):
+                if (y1 < y and y < y2):
+                    inside_pts.append(p)
+
+        return inside_pts      
+    
+    def contoursWithoutBatsman(self,action,debug):
+        batsman = None
+        found = False
+        for key in list(self.detections.keys()):
+            det = self.detections[key]
+            if len(det['area']) > 0:
+                batsman = det['bbox'][np.argmin(det['area'])]
+                found = True
+                break
+        if found:
+            self.batsman = [(int(batsman[1]),int(batsman[0])),(int(batsman[3]),int(batsman[2]))]
+
+                
+        if action == 1:
+            if found:
+                self.batsman = [(int(batsman[1]),int(batsman[0])),(int(batsman[3]),int(batsman[2]))]
+                for frame_ in self.contourCenters:
+                    inside_pts = pointInRect(self.batsman,frame_)
+                    for pt in frame_:
+                        if pt not in inside_pts:
+                            self.centersWithoutBatsman.append(pt)
+
+            else:
+                for frame_ in self.contourCenters:
+                    for pt in frame_:
+                        self.centersWithoutBatsman.append(pt)
+        
+        else:
+            self.centersWithoutBatsman = []
+            for _ in self.contourCenters:
+                for pt in _:
+                    self.centersWithoutBatsman.append(pt)
+                    
+        '''
+        debug
+        '''
+        if debug:
+            h,w  = rect[1][1] - rect[0][1], rect[1][0] - rect[0][0]
+            ctr_image = np.zeros((h,w,3), np.uint8) 
+            for pt in self.centersWithoutBatsman:
+                cv2.circle(ctr_image,pt,2,(255,255,255),-1)
+                
+            cv2.rectangle(ctr_image,(self.batsman[0][0],self.batsman[0][1]),(self.batsman[1][0],self.batsman[1][1]),(0,0,255),3)
+            fig,axs = plt.subplots(1,1,figsize=(5,5))
+            axs.imshow(ctr_image)
+            axs.set(title="contours without batsman")    
+               
+                
+    def removeNoise(self,ecu_distance,debug,removeBatsman):
+        
+#         if (self.batsman):
+#             if self.cam_orientation == 'right' and self.batsman_orientation == 'rhb':
+#                 targetRect = [(0,0),(self.batsman[1][0]+width,self.batsman[1][1]+bottom)]
+#             if self.cam_orientation == 'right' and self.batsman_orientation == 'lhb':
+#                 targetRect = [(self.batsman[0][0]-width,0),(self.frame_width,self.batsman[1][1]+bottom)]
+#             if self.cam_orientation == 'left' and self.batsman_orientation == 'lhb':
+#                 targetRect = [(self.batsman[0][0]-width,0),(self.frame_width,self.batsman[1][1]+bottom)]
+#             if self.cam_orientation == 'left' and self.batsman_orientation == 'rhb':
+#                 targetRect = [(0,0),(self.batsman[1][0]+width,self.batsman[1][1]+bottom)]
+
+                
+#             targetRect = [(0,0),(self.frame_width,self.batsman[1][0]+bottom)]
+#             inside_pts = pointInRect(targetRect,self.centersWithoutBatsman)
+
+#         else:
+
+        foundBatsman = False
+        try:
+            for i in range(0,20):
+                areas_ = self.allDetections[i]['area']
+                if len(areas_) > 0:
+                    ymax,xmax,ymin,xmin = self.allDetections[i]['dets'][np.argmin(np.asarray(areas_))]
+                    batsman_roi = ((int(xmin),int(ymin)),(int(xmax),int(ymax)))
+                    batsman_roi_ = ((int(xmax),int(ymax)),(int(xmin),int(ymin)))
+                    foundBatsman == True
+                    break
+        
+        except:
+            batsman_roi = [(0,0),(1,1)]
+            pass
+
+        inside_pts = []
+        for idx,x in enumerate(self.contourCenters):
+            if idx >= self.startFrame:
+                for id_r,pt in enumerate(x):
+                    inside_pts.append(pt)
+
+
+        print("initial :: " + str(len(inside_pts))) 
+        if removeBatsman and foundBatsman:
+            # print(batsman_roi)
+            # print("xxxx")
+            # print(inside_pts)
+            batsman_pts = self.ctrInRect(batsman_roi_,inside_pts)
+            print("len of batsman points :: " + str(len(batsman_pts)))
+
+            final_inside_pts = []
+            all_params = []
+            for pt in inside_pts:
+                if pt not in batsman_pts:
+                    final_inside_pts.append((pt[0],pt[1]))
+                    all_params.append((pt[0],pt[1],pt[2]))
+        else:
+            final_inside_pts = []
+            all_params = []
+            for pt in inside_pts:
+            # if pt not in batsman_pts:
+                final_inside_pts.append((pt[0],pt[1]))
+                all_params.append((pt[0],pt[1],pt[2]))           
+
+
+
+        inside_pts = final_inside_pts
+        print("initial :: " + str(len(inside_pts)))
+#         self.pureCenters = only_coords
+        if len(inside_pts) > 0:
+        #     x = np.array([
+        #         [x[0] for x in inside_pts],
+        #         [x[1] for x in inside_pts]
+        #     ])
+        #     a,b = np.tril_indices(len(x[0]), -1)
+        #     diss = np.linalg.norm(x[b] - x[a], axis=1)
+        #     near = x[np.unique(np.concatenate([b[diss < ecu_distance], a[diss < ecu_distance]]))]
+        #     remove = np.delete(x,np.unique(np.concatenate([b[diss < ecu_distance], a[diss < ecu_distance]])), axis=0)
+        #     for pt in remove:
+        #         idx_ = only_coords.index(pt)
+        #         self.pureCenters.append((pt[0],pt[1],inside_pts[idx_][2]))
+
+        #     for pts in near:
+        #         idx_ = only_coords.index(pt)
+
+            dists = euclidean_distances(inside_pts,inside_pts)
+            t = np.where(dists<ecu_distance)[0]
+            q = np.where(dists<ecu_distance)[1]
+            covered = []
+            removed_pts = []
+            for i in range(len(t)):
+                top = t[i]
+                bottom = q[i]
+#                 r = inside_pts[i][2]
+                if (top == bottom):
+                    continue
+                else:
+
+                    if (top,bottom) not in covered and (bottom,top) not in covered:
+                        covered.append((top,bottom))
+                        removed_pts.append((top))
+
+            self.pureCenters = [inside_pts[i] for i in range(len(inside_pts)) if i not in removed_pts]
+        
+        else:
+            self.pureCenters = inside_pts
+        '''
+        debug
+        '''
+        if debug:
+           
+            h,w  = self.roi[1][1] - self.roi[0][1], self.roi[1][0] - self.roi[0][0]
+            frame_copy = np.zeros((h,w,3), np.uint8) 
+            for pt in self.pureCenters:
+                cv2.circle(frame_copy,pt,2,(255,255,255),-1)
+
+            dets = self.allDetections[self.startFrame]['dets']
+            areas = self.allDetections[self.startFrame]['area']
+            batsman_idx,bowler_idx = np.argmin(areas),np.argmax(areas)
+            ymax,xmax,ymin,xmin = dets[bowler_idx]
+            cv2.rectangle(frame_copy,(int(xmin),int(ymin)),(int(xmax),int(ymax)),(255,0,0),1 )
+            
+            ymax,xmax,ymin,xmin = dets[batsman_idx]
+            cv2.rectangle(frame_copy,(int(xmin),int(ymin)),(int(xmax),int(ymax)),(255,0,0),1 )
+            
+            fig,axs = plt.subplots(1,1,figsize=(30,30))
+            axs.imshow(frame_copy)
+            output = '.'+self.input.split('.')[1]+'-all-contours.pdf'
+            fig.savefig(output)
+
+            
+        return all_params,batsman_roi,self.pureCenters
+    
+    def ctrInRect(self,rect,points):
+        inside_pts = []
+        x1, y1, x2,y2 = rect[0][0],rect[0][1],rect[1][0],rect[1][1]
+        for p in points:
+            x,y,r = p
+            if (x1 < x and x < x2):
+                if (y1 < y and y < y2):
+                    inside_pts.append((x,y,r))
+
+        return inside_pts
+
+    def gridSlice(self,shape,debug):
+        '''
+        debug
+        '''
+        h, w = self.roi[1][1] - self.roi[0][1], self.roi[1][0] - self.roi[0][0]
+        rows, cols = shape
+        dy, dx = h / rows, w / cols
+
+    
+        if debug:
+            frame_copy = np.zeros((h,w,3), np.uint8) 
+
+        prev_pt = (0,0)
+        start_prev_pt = (0,0)
+        for id_x,x in enumerate(np.linspace(start=dx, stop=w, num=cols)):
+            count = 0
+            col_pts = []
+            for id_y,y in enumerate(np.linspace(start=dy, stop=h, num=rows)):
+#                 print("Prev Point :: " + str(prev_pt) + " Current Points :: " + str((x,y)) + " " + str((id_x,id_y)))
+
+                rect_splice = [prev_pt,(int(x),int(y))]
+                bl_splice = self.pointInRect(rect_splice,self.pureCenters)
+                self.gridCenters[(id_x,id_y)] = bl_splice
+            
+                if debug:
+                    color = (random.randint(0,255),random.randint(0,255),random.randint(0,255))
+                    for pt in bl_splice:
+                        cv2.circle(frame_copy,pt,2,color,-1)
+                    #text_x,text_y = (int(prev_pt[0]+(dx/2)-10),int(prev_pt[1]+(dy/2)))
+                    cv2.rectangle(frame_copy,(int(prev_pt[0]),int(prev_pt[1])),(int(x),int(y)),(255,255,255),1)
+
+                count = count + 1
+                if count  == rows:
+                    prev_pt = (start_prev_pt[0],0)
+                    count = 0
+                elif count == 1:
+                    prev_pt = (prev_pt[0],y)
+                    start_prev_pt = (x,y)
+                else:
+                    prev_pt = (prev_pt[0],y)
+        
+        if debug:
+            #if (self.batsman):
+            #    cv2.rectangle(frame_copy,(self.batsman[0][0],self.batsman[0][1]),(self.batsman[1][0],self.batsman[1][1]),(0,0,255),1)
+            #for key in list(self.gridCenters.keys()):
+            #    x_ = key[0]
+            #    y_ = key[1]
+            #    val = len(self.gridCenters[key])
+            #    text_x,text_y = int(x_*dx + (dx/2)),int(y_*dy - 10 + (dy/2) + 20)
+                
+            detections = self.allDetections[self.startFrame]['dets']
+            for det in detections:
+                ymax,xmax,ymin,xmin = det
+                cv2.rectangle(frame_copy,(int(xmax),int(ymax)),(int(xmin),int(ymin)),(255,255,255),1 )
+            
+
+            fig,axs = plt.subplots(1,1,figsize=(15,15))
+            axs.imshow(frame_copy)
+            axs.set(title="Grid Points :: " + str(self.input))      
+            output = '.'+self.input.split('.')[1]+'-grid.pdf'
+            fig.savefig(output)
